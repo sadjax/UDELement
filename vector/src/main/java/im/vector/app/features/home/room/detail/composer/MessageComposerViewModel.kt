@@ -823,7 +823,7 @@ class MessageComposerViewModel @AssistedInject constructor(
                 if (isCancelled) {
                     audioMessageHelper.deleteRecording()
                 } else {
-                    audioMessageHelper.stopRecording(convertForSending = true)?.let { audioType ->
+                    audioMessageHelper.stopRecordingAndGetAudio(convertForSending = true)?.let { audioType ->
                         if (audioType.duration > 1000) {
                             room.sendMedia(
                                     attachment = audioType.toContentAttachmentData(isVoiceMessage = true),
@@ -857,7 +857,7 @@ class MessageComposerViewModel @AssistedInject constructor(
         audioMessageHelper.startOrPauseRecordingPlayback()
     }
 
-    private fun handleEndAllVoiceActions(deleteRecord: Boolean) {
+    private fun handleEndAllVoiceActions(deleteRecord: Boolean) = viewModelScope.launch {
         audioMessageHelper.clearTracker()
         audioMessageHelper.stopAllVoiceActionsAndGetAudio(deleteRecord)
     }
