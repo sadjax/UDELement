@@ -73,7 +73,7 @@ class MessageComposerViewModel @AssistedInject constructor(
         private val vectorPreferences: VectorPreferences,
         private val commandParser: CommandParser,
         private val rainbowGenerator: RainbowGenerator,
-        private val voiceMessageHelper: VoiceMessageHelper,
+        private val audioMessageHelper: AudioMessageHelper,
         private val analyticsTracker: AnalyticsTracker,
         private val voicePlayerHelper: VoicePlayerHelper
 ) : VectorViewModel<MessageComposerViewState, MessageComposerAction, MessageComposerViewEvents>(initialState) {
@@ -90,7 +90,6 @@ class MessageComposerViewModel @AssistedInject constructor(
     }
 
     override fun handle(action: MessageComposerAction) {
-        Timber.v("Handle action: $action")
         when (action) {
             is MessageComposerAction.EnterEditMode                  -> handleEnterEditMode(action)
             is MessageComposerAction.EnterQuoteMode                 -> handleEnterQuoteMode(action)
@@ -110,6 +109,7 @@ class MessageComposerViewModel @AssistedInject constructor(
             is MessageComposerAction.OnEntersBackground             -> handleEntersBackground(action.composerText)
             is MessageComposerAction.VoiceWaveformTouchedUp         -> handleVoiceWaveformTouchedUp(action)
             is MessageComposerAction.VoiceWaveformMovedTo           -> handleVoiceWaveformMovedTo(action)
+            is MessageComposerAction.AudioSeekBarMovedTo            -> handleAudioSeekBarMovedTo(action)
         }
     }
 
@@ -811,7 +811,7 @@ class MessageComposerViewModel @AssistedInject constructor(
 
     private fun handleStartRecordingVoiceMessage() {
         try {
-            voiceMessageHelper.startRecording(room.roomId)
+            audioMessageHelper.startRecording(room.roomId)
         } catch (failure: Throwable) {
             _viewEvents.post(MessageComposerViewEvents.VoicePlaybackOrRecordingFailure(failure))
         }
@@ -819,11 +819,11 @@ class MessageComposerViewModel @AssistedInject constructor(
 
     private fun handleEndRecordingVoiceMessage(isCancelled: Boolean, rootThreadEventId: String? = null) =
             viewModelScope.launch {
-                voiceMessageHelper.stopPlayback()
+                audioMessageHelper.stopPlayback()
                 if (isCancelled) {
-                    voiceMessageHelper.deleteRecording()
+                    audioMessageHelper.deleteRecording()
                 } else {
-                    voiceMessageHelper.stopRecordingAndGetAudio(convertForSending = true)?.let { audioType ->
+                    audioMessageHelper.stopRecording(convertForSending = true)?.let { audioType ->
                         if (audioType.duration > 1000) {
                             room.sendMedia(
                                     attachment = audioType.toContentAttachmentData(isVoiceMessage = true),
@@ -831,7 +831,7 @@ class MessageComposerViewModel @AssistedInject constructor(
                                     roomIds = emptySet(),
                                     rootThreadEventId = rootThreadEventId)
                         } else {
-                            voiceMessageHelper.deleteRecording()
+                            audioMessageHelper.deleteRecording()
                         }
                     }
                 }
@@ -846,7 +846,7 @@ class MessageComposerViewModel @AssistedInject constructor(
                 // Conversion can fail, fallback to the original file in this case and let the player fail for us
                 val convertedFile = voicePlayerHelper.convertFile(audioFile) ?: audioFile
                 // Play can fail
-                voiceMessageHelper.startOrPausePlayback(action.eventId, convertedFile)
+                audioMessageHelper.startOrPausePlayback(action.eventId, convertedFile)
             } catch (failure: Throwable) {
                 _viewEvents.post(MessageComposerViewEvents.VoicePlaybackOrRecordingFailure(failure))
             }
@@ -854,35 +854,39 @@ class MessageComposerViewModel @AssistedInject constructor(
     }
 
     private fun handlePlayOrPauseRecordingPlayback() {
-        voiceMessageHelper.startOrPauseRecordingPlayback()
+        audioMessageHelper.startOrPauseRecordingPlayback()
     }
 
-    private fun handleEndAllVoiceActions(deleteRecord: Boolean) = viewModelScope.launch {
-        voiceMessageHelper.clearTracker()
-        voiceMessageHelper.stopAllVoiceActionsAndGetAudio(deleteRecord)
+    private fun handleEndAllVoiceActions(deleteRecord: Boolean) {
+        audioMessageHelper.clearTracker()
+        audioMessageHelper.stopAllVoiceActionsAndGetAudio(deleteRecord)
     }
 
     private fun handleInitializeVoiceRecorder(attachmentData: ContentAttachmentData) {
-        voiceMessageHelper.initializeRecorder(attachmentData)
+        audioMessageHelper.initializeRecorder(attachmentData)
         setState { copy(voiceRecordingUiState = VoiceMessageRecorderView.RecordingUiState.Draft) }
     }
 
     private fun handlePauseRecordingVoiceMessage() {
-        voiceMessageHelper.pauseRecording()
+        audioMessageHelper.pauseRecording()
     }
 
     private fun handleVoiceWaveformTouchedUp(action: MessageComposerAction.VoiceWaveformTouchedUp) {
-        voiceMessageHelper.movePlaybackTo(action.eventId, action.percentage, action.duration)
+        audioMessageHelper.movePlaybackTo(action.eventId, action.percentage, action.duration)
     }
 
     private fun handleVoiceWaveformMovedTo(action: MessageComposerAction.VoiceWaveformMovedTo) {
-        voiceMessageHelper.movePlaybackTo(action.eventId, action.percentage, action.duration)
+        audioMessageHelper.movePlaybackTo(action.eventId, action.percentage, action.duration)
+    }
+
+    private fun handleAudioSeekBarMovedTo(action: MessageComposerAction.AudioSeekBarMovedTo) {
+        audioMessageHelper.movePlaybackTo(action.eventId, action.percentage, action.duration)
     }
 
     private fun handleEntersBackground(composerText: String) = viewModelScope.launch {
         // Always stop all voice actions. It may be playing in timeline or active recording
-        val playingAudioContent = voiceMessageHelper.stopAllVoiceActionsAndGetAudio(deleteRecord = false)
-        voiceMessageHelper.clearTracker()
+        val playingAudioContent = audioMessageHelper.stopAllVoiceActionsAndGetAudio(deleteRecord = false)
+        audioMessageHelper.clearTracker()
 
         val isVoiceRecording = com.airbnb.mvrx.withState(this@MessageComposerViewModel) { it.isVoiceRecording }
         if (isVoiceRecording) {

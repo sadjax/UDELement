@@ -17,7 +17,6 @@
 package im.vector.app.features.onboarding
 
 import android.content.Context
-import android.net.Uri
 import com.airbnb.mvrx.MavericksViewModelFactory
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedFactory
@@ -45,7 +44,6 @@ import im.vector.app.features.login.SignMode
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
-import org.matrix.android.sdk.api.MatrixPatterns.getDomain
 import org.matrix.android.sdk.api.auth.AuthenticationService
 import org.matrix.android.sdk.api.auth.HomeServerHistoryService
 import org.matrix.android.sdk.api.auth.data.HomeServerConnectionConfig
@@ -55,9 +53,6 @@ import org.matrix.android.sdk.api.auth.registration.FlowResult
 import org.matrix.android.sdk.api.auth.registration.RegistrationResult
 import org.matrix.android.sdk.api.auth.registration.RegistrationWizard
 import org.matrix.android.sdk.api.auth.registration.Stage
-import org.matrix.android.sdk.api.auth.wellknown.WellknownResult
-import org.matrix.android.sdk.api.failure.Failure
-import org.matrix.android.sdk.api.failure.MatrixIdFailure
 import org.matrix.android.sdk.api.session.Session
 import timber.log.Timber
 import java.util.UUID
@@ -79,6 +74,7 @@ class OnboardingViewModel @AssistedInject constructor(
         private val analyticsTracker: AnalyticsTracker,
         private val uriFilenameResolver: UriFilenameResolver,
         private val registrationActionHandler: RegistrationActionHandler,
+        private val directLoginUseCase: DirectLoginUseCase,
         private val vectorOverrides: VectorOverrides
 ) : VectorViewModel<OnboardingViewState, OnboardingAction, OnboardingViewEvents>(initialState) {
 
@@ -145,6 +141,7 @@ class OnboardingViewModel @AssistedInject constructor(
             is OnboardingAction.InitWith                   -> handleInitWith(action)
             is OnboardingAction.UpdateHomeServer           -> handleUpdateHomeserver(action).also { lastAction = action }
             is OnboardingAction.LoginOrRegister            -> handleLoginOrRegister(action).also { lastAction = action }
+            is OnboardingAction.Register                   -> handleRegisterWith(action).also { lastAction = action }
             is OnboardingAction.LoginWithToken             -> handleLoginWithToken(action)
             is OnboardingAction.WebLoginSuccess            -> handleWebLoginSuccess(action)
             is OnboardingAction.ResetPassword              -> handleResetPassword(action)
@@ -280,7 +277,7 @@ class OnboardingViewModel @AssistedInject constructor(
         }
     }
 
-    private fun handleRegisterWith(action: OnboardingAction.LoginOrRegister) {
+    private fun handleRegisterWith(action: OnboardingAction.Register) {
         reAuthHelper.data = action.password
         handleRegisterAction(RegisterAction.CreateAccount(
                 action.username,
@@ -316,7 +313,7 @@ class OnboardingViewModel @AssistedInject constructor(
                     }
                 }
             }
-            OnboardingAction.ResetSignMode       -> {
+            OnboardingAction.ResetSignMode              -> {
                 setState {
                     copy(
                             isLoading = false,
@@ -326,13 +323,13 @@ class OnboardingViewModel @AssistedInject constructor(
                     )
                 }
             }
-            OnboardingAction.ResetLogin          -> {
+            OnboardingAction.ResetAuthenticationAttempt -> {
                 viewModelScope.launch {
                     authenticationService.cancelPendingLoginOrRegistration()
                     setState { copy(isLoading = false) }
                 }
             }
-            OnboardingAction.ResetResetPassword  -> {
+            OnboardingAction.ResetResetPassword         -> {
                 setState {
                     copy(
                             isLoading = false,
@@ -360,7 +357,13 @@ class OnboardingViewModel @AssistedInject constructor(
 
     private fun handleUpdateUseCase(action: OnboardingAction.UpdateUseCase) {
         setState { copy(useCase = action.useCase) }
-        _viewEvents.post(OnboardingViewEvents.OpenServerSelection)
+        when (vectorFeatures.isOnboardingCombinedRegisterEnabled()) {
+            true  -> {
+                handle(OnboardingAction.UpdateHomeServer(matrixOrgUrl))
+                OnboardingViewEvents.OpenCombinedRegister
+            }
+            false -> _viewEvents.post(OnboardingViewEvents.OpenServerSelection)
+        }
     }
 
     private fun resetUseCase() {
@@ -463,81 +466,21 @@ class OnboardingViewModel @AssistedInject constructor(
         when (state.signMode) {
             SignMode.Unknown            -> error("Developer error, invalid sign mode")
             SignMode.SignIn             -> handleLogin(action)
-            SignMode.SignUp             -> handleRegisterWith(action)
+            SignMode.SignUp             -> handleRegisterWith(OnboardingAction.Register(action.username, action.password, action.initialDeviceName))
             SignMode.SignInWithMatrixId -> handleDirectLogin(action, null)
         }
     }
 
     private fun handleDirectLogin(action: OnboardingAction.LoginOrRegister, homeServerConnectionConfig: HomeServerConnectionConfig?) {
         setState { copy(isLoading = true) }
-
         currentJob = viewModelScope.launch {
-            val data = try {
-                authenticationService.getWellKnownData(action.username, homeServerConnectionConfig)
-            } catch (failure: Throwable) {
-                onDirectLoginError(failure)
-                return@launch
-            }
-            when (data) {
-                is WellknownResult.Prompt     ->
-                    directLoginOnWellknownSuccess(action, data, homeServerConnectionConfig)
-                is WellknownResult.FailPrompt ->
-                    // Relax on IS discovery if homeserver is valid
-                    if (data.homeServerUrl != null && data.wellKnown != null) {
-                        directLoginOnWellknownSuccess(action, WellknownResult.Prompt(data.homeServerUrl!!, null, data.wellKnown!!), homeServerConnectionConfig)
-                    } else {
-                        onWellKnownError()
+            directLoginUseCase.execute(action, homeServerConnectionConfig).fold(
+                    onSuccess = { onSessionCreated(it, isAccountCreated = false) },
+                    onFailure = {
+                        setState { copy(isLoading = false) }
+                        _viewEvents.post(OnboardingViewEvents.Failure(it))
                     }
-                else                          -> {
-                    onWellKnownError()
-                }
-            }
-        }
-    }
-
-    private fun onWellKnownError() {
-        setState { copy(isLoading = false) }
-        _viewEvents.post(OnboardingViewEvents.Failure(Exception(stringProvider.getString(R.string.autodiscover_well_known_error))))
-    }
-
-    private suspend fun directLoginOnWellknownSuccess(action: OnboardingAction.LoginOrRegister,
-                                                      wellKnownPrompt: WellknownResult.Prompt,
-                                                      homeServerConnectionConfig: HomeServerConnectionConfig?) {
-        val alteredHomeServerConnectionConfig = homeServerConnectionConfig
-                ?.copy(
-                        homeServerUriBase = Uri.parse(wellKnownPrompt.homeServerUrl),
-                        identityServerUri = wellKnownPrompt.identityServerUrl?.let { Uri.parse(it) }
-                )
-                ?: HomeServerConnectionConfig(
-                        homeServerUri = Uri.parse("https://${action.username.getDomain()}"),
-                        homeServerUriBase = Uri.parse(wellKnownPrompt.homeServerUrl),
-                        identityServerUri = wellKnownPrompt.identityServerUrl?.let { Uri.parse(it) }
-                )
-
-        val data = try {
-            authenticationService.directAuthentication(
-                    alteredHomeServerConnectionConfig,
-                    action.username,
-                    action.password,
-                    action.initialDeviceName)
-        } catch (failure: Throwable) {
-            onDirectLoginError(failure)
-            return
-        }
-        onSessionCreated(data, isAccountCreated = false)
-    }
-
-    private fun onDirectLoginError(failure: Throwable) {
-        when (failure) {
-            is MatrixIdFailure.InvalidMatrixId,
-            is Failure.UnrecognizedCertificateFailure -> {
-                setState { copy(isLoading = false) }
-                // Display this error in a dialog
-                _viewEvents.post(OnboardingViewEvents.Failure(failure))
-            }
-            else                                      -> {
-                setState { copy(isLoading = false) }
-            }
+            )
         }
     }
 
